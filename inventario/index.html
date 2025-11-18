@@ -1,0 +1,241 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Inventario - Detección objetos salón</title>
+  <style>
+    body{font-family:Arial,Helvetica,sans-serif;padding:20px;background:#f6f7fb}
+    .container{max-width:900px;margin:0 auto;background:white;padding:16px;border-radius:8px;box-shadow:0 6px 20px rgba(0,0,0,0.06)}
+    h1{margin-top:0}
+    #preview{max-width:100%;height:auto;border:1px solid #ddd}
+    canvas{max-width:100%;height:auto}
+    .controls{display:flex;gap:8px;align-items:center;margin-bottom:12px}
+    .counts{margin-top:12px}
+    .count-item{display:inline-block;padding:6px 10px;border-radius:6px;background:#eef3ff;margin:4px}
+    label.button{background:#1e88e5;color:white;padding:8px 12px;border-radius:6px;cursor:pointer}
+    input[type=file]{display:none}
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h1>Inventario - Detección y conteo (local)</h1>
+    <p>Sube una imagen (.jpg/.png) del salón y el modelo (local) hará la detección y mostrará los recuadros en azul con el número asignado a cada clase.</p>
+
+    <div class="controls">
+      <label class="button">Seleccionar imagen<input id="file" type="file" accept="image/*"></label>
+      <button id="runBtn">Detectar</button>
+      <div id="status"></div>
+    </div>
+
+    <div>
+      <img id="img" crossorigin="anonymous" style="display:none" />
+      <canvas id="canvas"></canvas>
+    </div>
+
+    <div class="counts" id="counts"></div>
+
+    <hr />
+    
+  
+    <pre>
+0 - CPU
+1 - Mesa
+2 - Mouse
+3 - Pantalla
+4 - Silla
+5 - Teclado
+    </pre>
+  </div>
+
+
+  <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.11.0/dist/tf.min.js"></script>
+
+  <script>
+    
+    const MODEL_PATH = 'model.json';
+
+    // Mapea nombres (si tu modelo devuelve índices) -> número mostrado
+    const LABELS = {
+      0: 'CPU',
+      1: 'Mesa',
+      2: 'Mouse',
+      3: 'Pantalla',
+      4: 'Silla',
+      5: 'Teclado'
+    };
+
+    // Para mostrar el número solicitado por la consigna: asignamos index -> etiqueta numérica (0..5)
+    const LABEL_TO_NUMBER = {
+      'CPU': 0,'Mesa':1,'Mouse':2,'Pantalla':3,'Silla':4,'Teclado':5
+    };
+
+    const fileInput = document.getElementById('file');
+    const imgEl = document.getElementById('img');
+    const canvas = document.getElementById('canvas');
+    const ctx = canvas.getContext('2d');
+    const status = document.getElementById('status');
+    const countsDiv = document.getElementById('counts');
+    const runBtn = document.getElementById('runBtn');
+
+    let model = null;
+    let latestImage = null;
+
+    async function loadModel(){
+      status.innerText = 'Cargando modelo...';
+      try{
+        model = await tf.loadGraphModel(MODEL_PATH);
+        status.innerText = 'Modelo cargado.';
+      }catch(err){
+        console.error(err);
+        status.innerText = 'ERROR cargando modelo. Revisa la consola y la ruta '+MODEL_PATH;
+        throw err;
+      }
+    }
+
+    fileInput.addEventListener('change', (e)=>{
+      const f = e.target.files[0];
+      if(!f) return;
+      const url = URL.createObjectURL(f);
+      imgEl.src = url;
+      imgEl.style.display = 'block';
+      latestImage = imgEl;
+      imgEl.onload = ()=>{
+        canvas.width = imgEl.naturalWidth;
+        canvas.height = imgEl.naturalHeight;
+        ctx.drawImage(imgEl,0,0);
+      }
+    });
+
+    runBtn.addEventListener('click', async ()=>{
+      if(!latestImage){ alert('Selecciona una imagen primero'); return; }
+      if(!model) await loadModel();
+      await detectImage(latestImage);
+    });
+
+    // Preprocess: convierte image a tensor y redimensiona si el modelo lo requiere.
+    function imageToTensor(img){
+      return tf.tidy(()=>{
+        let t = tf.browser.fromPixels(img).toFloat();
+        // normalizar si el modelo lo espera (0-1)
+        t = t.div(255.0);
+        // añadir batch
+        t = t.expandDims(0);
+        return t;
+      });
+    }
+
+    async function detectImage(img){
+      status.innerText = 'Detectando...';
+      tf.engine().startScope();
+      try{
+        const inputTensor = imageToTensor(img);
+        // Muchos modelos del TF OD API exponen esta firma: ["raw_outputs/box_encodings", "raw_outputs/class_predictions"] etc.
+        // Sin embargo, el formato más común convertido a TFJS con detect API devuelve: boxes, scores, classes, num_detections
+        const outputs = await model.executeAsync(inputTensor);
+
+        // outputs puede ser un tensor o un array de tensores. Normalizamos a array.
+        let out = outputs;
+        if(!Array.isArray(out)) out = [out];
+
+        // Intentaremos reconocer outputs por tamaño/shape -> busca boxes, scores, classes
+        // Caso esperado (TF OD API converted graph): outputs[0]=boxes, outputs[1]=scores, outputs[2]=classes, outputs[3]=num_detections
+
+        let boxesTensor, scoresTensor, classesTensor, numDetTensor;
+        if(out.length >= 4){
+          boxesTensor = out[0]; scoresTensor = out[1]; classesTensor = out[2]; numDetTensor = out[3];
+        } else if(out.length === 1){
+          // A veces el modelo devuelve un dict-like object (no aquí). En tal caso el desarrollador deberá adaptar.
+          throw new Error('Modelo devolvió un único tensor. Se espera boxes,scores,classes,num_detections. Convierte modelo con TF Object Detection API -> TFJS siguiendo la guía.');
+        } else {
+          throw new Error('Formato de salida inesperado del modelo. Se necesitan boxes,scores,classes,num_detections');
+        }
+
+        const boxes = await boxesTensor.array();
+        const scores = await scoresTensor.array();
+        const classes = await classesTensor.array();
+        const numDet = (await numDetTensor.array())[0];
+
+        // las shapes suelen ser [1, N, 4], [1, N], [1, N]
+        const b = boxes[0];
+        const s = scores[0];
+        const c = classes[0];
+        const N = Math.min(b.length, s.length, c.length, Math.round(numDet));
+
+        // umbral de confianza
+        const THRESH = 0.45;
+
+        // limpiar canvas y dibujar imagen base
+        ctx.clearRect(0,0,canvas.width,canvas.height);
+        ctx.drawImage(img,0,0);
+
+        const counts = {}; // cuenta por clase
+
+        for(let i=0;i<N;i++){
+          if(s[i] < THRESH) continue;
+          // caja está en formato [ymin,xmin,ymax,xmax] valores relativos (0..1)
+          const ymin = b[i][0]*canvas.height;
+          const xmin = b[i][1]*canvas.width;
+          const ymax = b[i][2]*canvas.height;
+          const xmax = b[i][3]*canvas.width;
+          const w = xmax - xmin;
+          const h = ymax - ymin;
+
+          // clase puede venir como float índice (ej 1.0 -> 1)
+          const clsIndex = Math.round(c[i]);
+          const label = LABELS[clsIndex] || ('Clase_'+clsIndex);
+          const numberToShow = LABEL_TO_NUMBER[label] !== undefined ? LABEL_TO_NUMBER[label] : clsIndex;
+
+          counts[label] = (counts[label] || 0) + 1;
+
+          // dibujar rectángulo en azul y número grande
+          ctx.lineWidth = Math.max(2, Math.round(Math.min(canvas.width, canvas.height)/200));
+          ctx.strokeStyle = '#0b61ff';
+          ctx.fillStyle = '#0b61ff';
+          ctx.strokeRect(xmin, ymin, w, h);
+
+          // etiqueta de número en fondo semitransparente
+          const fontSize = Math.max(12, Math.round(Math.min(canvas.width, canvas.height)/40));
+          ctx.font = `${fontSize}px Arial`;
+          const text = String(numberToShow);
+          const textWidth = ctx.measureText(text).width;
+          const pad = 6;
+
+          // cuadro para texto
+          ctx.globalAlpha = 0.85;
+          ctx.fillStyle = '#0b61ff';
+          ctx.fillRect(xmin, Math.max(0,ymin - fontSize - pad), textWidth + pad*2, fontSize + pad/1.5);
+          ctx.globalAlpha = 1.0;
+
+          // texto en blanco
+          ctx.fillStyle = 'white';
+          ctx.fillText(text, xmin + pad, Math.max(0,ymin - pad/2));
+        }
+
+        // mostrar conteo
+        countsDiv.innerHTML = '';
+        Object.keys(counts).forEach(k=>{
+          const n = counts[k];
+          const numberToShow = LABEL_TO_NUMBER[k] !== undefined ? LABEL_TO_NUMBER[k] : '?';
+          const div = document.createElement('div');
+          div.className = 'count-item';
+          div.innerText = `${numberToShow} - ${k}: ${n}`;
+          countsDiv.appendChild(div);
+        });
+
+        status.innerText = 'Detección completa.';
+
+        // limpiar tensores
+        tf.dispose(outputs);
+        tf.dispose(inputTensor);
+      }catch(err){
+        console.error(err);
+        status.innerText = 'Error en detección: ' + err.message;
+      }finally{
+        tf.engine().endScope();
+      }
+    }
+  </script>
+  
+</body>
+</html>
